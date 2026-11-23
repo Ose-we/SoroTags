@@ -65,6 +65,7 @@ describe('GET /federation', () => {
     const response = await request(app).get('/federation?q=unknown*localhost');
     
     expect(response.status).toBe(404);
+    expect(response.body.error.code).toBe('NOT_FOUND');
     expect(response.body.error.message).toBe('Name tag not found');
   });
 

@@ -206,9 +206,7 @@ router.post(
     }
 
     if (!StrKey.isValidEd25519PublicKey(address)) {
-      const error = new Error("Invalid Stellar Public Key format.");
-      error.statusCode = 400;
-      return next(error);
+      return next(new ApiError("INVALID_INPUT", "Invalid Stellar address"));
     }
 
     const memoError = validateMemo(memoType, memo);

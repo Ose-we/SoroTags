@@ -9,6 +9,7 @@ let mockWorkerProcessor;
 let mockWorkerOptions;
 
 jest.mock('bullmq', () => ({
+  UnrecoverableError: class UnrecoverableError extends Error {},
   Queue: jest.fn().mockImplementation(() => ({
     add: mockQueueAdd,
     on: mockQueueOn,
@@ -37,13 +38,13 @@ const {
   processWebhookJob,
   detectSsrfTarget,
   MAX_WEBHOOK_ATTEMPTS,
-  WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_QUEUE_NAME,
   WEBHOOK_RETRY_BASE_MS,
   WEBHOOK_RETRY_MAX_MS,
   WEBHOOK_RETRY_FACTOR,
+  moveWebhookEventToDLQ,
 } = require('../src/webhookWorker');
-const { exponentialDelay } = require('../src/utils/exponentialDelay');
+const { exponentialDelay } = require('../src/utils');
 
 const webhook = {
   id: 'webhook-1',
@@ -80,10 +81,7 @@ describe('webhook BullMQ delivery', () => {
       { webhook, payload },
       expect.objectContaining({
         attempts: MAX_WEBHOOK_ATTEMPTS,
-        backoff: {
-          type: 'exponential',
-          delay: WEBHOOK_BACKOFF_DELAY_MS,
-        },
+        backoff: { type: 'custom' },
         jobId: expect.any(String),
       }),
     );
@@ -126,15 +124,17 @@ describe('webhook BullMQ delivery', () => {
 
   test('worker throws failed deliveries so BullMQ retries them', async () => {
     global.fetch.mockResolvedValue({ ok: false, status: 503 });
+    const webhookEventUpdate = jest.fn().mockResolvedValue({});
     const prisma = {
       webhook: {
         findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
         update: jest.fn().mockResolvedValue({}),
       },
+      webhookEvent: { update: webhookEventUpdate },
     };
 
     await expect(processWebhookJob(
-      { data: { webhook, payload }, attemptsMade: 0 },
+      { data: { webhook, payload, webhookEventId: 'event-1' }, attemptsMade: 0 },
       { prisma, poolRunFn: jest.fn() },
     )).rejects.toThrow('HTTP 503');
 
@@ -142,18 +142,28 @@ describe('webhook BullMQ delivery', () => {
       where: { id: webhook.id },
       data: expect.objectContaining({ failingSince: expect.any(Date) }),
     }));
+    expect(webhookEventUpdate).toHaveBeenCalledWith({
+      where: { id: 'event-1' },
+      data: expect.objectContaining({
+        attemptCount: { increment: 1 },
+        status: 'failed',
+        lastError: 'Webhook responded with HTTP 503',
+      }),
+    });
   });
 
-  test('worker marks a recovered webhook as successful', async () => {
+  test('successful delivery on retry 3 marks the event as delivered', async () => {
     global.fetch.mockResolvedValue({ ok: true, status: 200 });
+    const webhookEventUpdate = jest.fn().mockResolvedValue({});
     const prisma = {
       webhook: {
         update: jest.fn().mockResolvedValue({}),
       },
+      webhookEvent: { update: webhookEventUpdate },
     };
 
     await processWebhookJob(
-      { data: { webhook, payload }, attemptsMade: 2 },
+      { data: { webhook, payload, webhookEventId: 'event-1' }, attemptsMade: 2 },
       { prisma, poolRunFn: jest.fn() },
     );
 
@@ -161,6 +171,147 @@ describe('webhook BullMQ delivery', () => {
       where: { id: webhook.id },
       data: expect.objectContaining({ failingSince: null }),
     }));
+    expect(webhookEventUpdate).toHaveBeenCalledWith({
+      where: { id: 'event-1' },
+      data: expect.objectContaining({
+        attemptCount: { increment: 1 },
+        status: 'delivered',
+        lastError: null,
+        deliveredAt: expect.any(Date),
+      }),
+    });
+  });
+
+  test('increments the event attempt count once for each failed delivery attempt', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 503 });
+    const webhookEventUpdate = jest.fn().mockResolvedValue({});
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      webhookEvent: { update: webhookEventUpdate },
+    };
+
+    for (let attemptsMade = 0; attemptsMade < MAX_WEBHOOK_ATTEMPTS; attemptsMade++) {
+      await expect(
+        processWebhookJob(
+          { data: { webhook, payload, webhookEventId: 'event-1' }, attemptsMade },
+          { prisma, poolRunFn: jest.fn() },
+        ),
+      ).rejects.toThrow('HTTP 503');
+    }
+
+    expect(global.fetch).toHaveBeenCalledTimes(MAX_WEBHOOK_ATTEMPTS);
+    expect(webhookEventUpdate).toHaveBeenCalledTimes(MAX_WEBHOOK_ATTEMPTS);
+    for (const [call] of webhookEventUpdate.mock.calls) {
+      expect(call.data.attemptCount).toEqual({ increment: 1 });
+      expect(call.data.status).toBe('failed');
+    }
+  });
+
+  test('dispatch records a WebhookEvent and attaches it to the queued delivery', async () => {
+    const queue = { add: jest.fn().mockResolvedValue({}) };
+    const webhookEvent = {
+      upsert: jest.fn().mockResolvedValue({ id: 'event-1' }),
+    };
+    const prisma = {
+      webhook: { findMany: jest.fn().mockResolvedValue([webhook]) },
+      webhookEvent,
+    };
+
+    await dispatchPaymentWebhooks({
+      prisma,
+      poolGetFn: jest.fn(),
+      queue,
+      payment: {
+        id: 'payment-1',
+        type: 'payment',
+        transaction_hash: 'transaction-1',
+        to: 'GDESTINATION',
+        amount: '10.00',
+        asset_type: 'native',
+      },
+    });
+
+    expect(webhookEvent.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          eventType: 'payment.received',
+          payload: expect.any(String),
+          merchantId: webhook.id,
+          status: 'pending',
+        }),
+      }),
+    );
+    expect(queue.add).toHaveBeenCalledWith(
+      'deliver',
+      expect.objectContaining({ webhookEventId: expect.any(String) }),
+      expect.any(Object),
+    );
+  });
+
+  test('moves an exhausted delivery to DLQ with its attempt count and last error', async () => {
+    const error = new Error('Webhook responded with HTTP 503');
+    const prisma = {
+      webhookDLQ: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({}),
+      },
+      webhookEvent: { update: jest.fn().mockResolvedValue({}) },
+    };
+    const jobData = {
+      webhook,
+      payload,
+      webhookEventId: 'event-1',
+    };
+
+    await moveWebhookEventToDLQ(prisma, jobData, MAX_WEBHOOK_ATTEMPTS, error);
+
+    expect(prisma.webhookDLQ.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        webhookId: webhook.id,
+        eventType: payload.event,
+        eventPayload: JSON.stringify(payload),
+        failureReason: error.message,
+        deliveryAttempts: MAX_WEBHOOK_ATTEMPTS,
+      }),
+    });
+    expect(prisma.webhookEvent.update).toHaveBeenCalledWith({
+      where: { id: 'event-1' },
+      data: {
+        attemptCount: MAX_WEBHOOK_ATTEMPTS,
+        lastError: error.message,
+        status: 'dead_letter',
+      },
+    });
+  });
+
+  test.each([429, 500, 502, 503, 504])(
+    'retries on transient HTTP %i responses',
+    async (status) => {
+      global.fetch.mockResolvedValue({ ok: false, status });
+      await expect(
+        require('../src/webhookWorker').sendWebhook(
+          webhook.url,
+          payload,
+          webhook.secret,
+        ),
+      ).rejects.toThrow(`HTTP ${status}`);
+    },
+  );
+
+  test('does not retry a non-transient HTTP response', async () => {
+    const { UnrecoverableError } = require('bullmq');
+    global.fetch.mockResolvedValue({ ok: false, status: 400 });
+
+    await expect(
+      require('../src/webhookWorker').sendWebhook(
+        webhook.url,
+        payload,
+        webhook.secret,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
   });
 
   test('configures and starts a BullMQ webhook worker', () => {
@@ -175,10 +326,61 @@ describe('webhook BullMQ delivery', () => {
     expect(Worker).toHaveBeenCalledWith(
       WEBHOOK_QUEUE_NAME,
       expect.any(Function),
-      expect.objectContaining({ concurrency: 10 }),
+      expect.objectContaining({
+        concurrency: 10,
+        settings: expect.objectContaining({
+          backoffStrategy: expect.any(Function),
+        }),
+      }),
     );
     expect(mockWorkerOptions.connection).toEqual(expect.objectContaining({ quit: mockRedisQuit }));
     expect(mockWorkerProcessor).toEqual(expect.any(Function));
+
+    const strategy = mockWorkerOptions.settings.backoffStrategy;
+    expect(strategy(1, 'custom')).toBeGreaterThanOrEqual(
+      Math.floor(WEBHOOK_RETRY_BASE_MS * 0.9),
+    );
+    expect(strategy(1, 'custom')).toBeLessThanOrEqual(
+      Math.ceil(WEBHOOK_RETRY_BASE_MS * 1.1),
+    );
+    expect(strategy(2, 'custom')).toBeGreaterThanOrEqual(
+      Math.floor(WEBHOOK_RETRY_BASE_MS * WEBHOOK_RETRY_FACTOR * 0.9),
+    );
+  });
+
+  test('moves an event to DLQ only once all five attempts are exhausted', async () => {
+    await closeWebhookQueue();
+    mockWorkerOn.mockClear();
+
+    const prisma = {
+      webhook: {},
+      webhookDLQ: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({}),
+      },
+      webhookEvent: { update: jest.fn().mockResolvedValue({}) },
+    };
+    startWebhookWorker({ prisma, poolRunFn: jest.fn() });
+    const failedHandler = mockWorkerOn.mock.calls.find(
+      ([eventName]) => eventName === 'failed',
+    )[1];
+    const job = {
+      id: 'job-1',
+      opts: { attempts: MAX_WEBHOOK_ATTEMPTS },
+      attemptsMade: 4,
+      data: { webhook, payload, webhookEventId: 'event-1' },
+    };
+    const error = new Error('Webhook responded with HTTP 503');
+
+    await failedHandler(job, error);
+    expect(prisma.webhookDLQ.create).not.toHaveBeenCalled();
+
+    job.attemptsMade = MAX_WEBHOOK_ATTEMPTS;
+    await failedHandler(job, error);
+    expect(prisma.webhookDLQ.create).toHaveBeenCalledTimes(1);
+    expect(prisma.webhookDLQ.create.mock.calls[0][0].data.deliveryAttempts).toBe(
+      MAX_WEBHOOK_ATTEMPTS,
+    );
   });
 
   test('respects WEBHOOK_CONCURRENCY env var for concurrency cap (issue #26)', () => {

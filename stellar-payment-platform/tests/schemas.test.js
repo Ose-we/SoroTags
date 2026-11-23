@@ -115,6 +115,11 @@ describe('request schemas', () => {
       expect(federationQuerySchema.safeParse({ q: 'alice*localhost', type: 'name' }).success).toBe(true);
     });
 
+    test('accepts a raw address only for type=id lookups', () => {
+      expect(federationQuerySchema.safeParse({ q: 'GABC123', type: 'id' }).success).toBe(true);
+      expect(federationQuerySchema.safeParse({ q: 'GABC123' }).success).toBe(false);
+    });
+
     test.each([
       ['missing q', {}],
       ['whitespace-only q', { q: '   ' }],

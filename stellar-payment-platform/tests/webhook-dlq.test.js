@@ -20,6 +20,7 @@ const webhookWorker = require('../src/webhookWorker');
 const {
   getWebhooksExhaustedRetries,
   moveToDLQ,
+  moveWebhookEventToDLQ,
   listDLQEntries,
   replayFromDLQ,
 } = webhookWorker;
@@ -50,6 +51,9 @@ beforeEach(() => {
     create: jest.fn().mockResolvedValue({}),
     update: jest.fn().mockResolvedValue({}),
     count: jest.fn().mockResolvedValue(0),
+  };
+  prisma.webhookEvent = {
+    update: jest.fn().mockResolvedValue({}),
   };
   prisma.$transaction = jest.fn(async (queries) => Promise.all(queries));
 });
@@ -109,6 +113,44 @@ describe('moveToDLQ', () => {
     expect(createData.username).toBe('alice');
     expect(createData.replayed).toBe(false);
     expect(createData.failureReason).toContain('exhausted');
+  });
+});
+
+describe('moveWebhookEventToDLQ', () => {
+  it('preserves the original event and final attempt details in the DLQ', async () => {
+    const webhook = {
+      id: 'wh-event',
+      username: 'alice',
+      url: 'https://example.com/hook',
+      secret: 'secret',
+    };
+    const payload = { event: 'payment.received', event_id: 'payment-1' };
+    const error = new Error('Webhook responded with HTTP 503');
+
+    await moveWebhookEventToDLQ(
+      prisma,
+      { webhook, payload, webhookEventId: 'event-1' },
+      5,
+      error,
+    );
+
+    expect(prisma.webhookDLQ.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        webhookId: webhook.id,
+        eventType: payload.event,
+        eventPayload: JSON.stringify(payload),
+        deliveryAttempts: 5,
+        failureReason: error.message,
+      }),
+    });
+    expect(prisma.webhookEvent.update).toHaveBeenCalledWith({
+      where: { id: 'event-1' },
+      data: expect.objectContaining({
+        attemptCount: 5,
+        lastError: error.message,
+        status: 'dead_letter',
+      }),
+    });
   });
 });
 

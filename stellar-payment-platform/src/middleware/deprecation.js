@@ -54,6 +54,7 @@ const pathMatches = (pattern, path) => {
 const findDeprecation = (method, path, registry = DEPRECATIONS) => {
   const verb = String(method || '').toUpperCase();
   for (const entry of registry) {
+    if (entry.kind === 'header' || typeof entry.path !== 'string') continue;
     const entryMethod = String(entry.method || '*').toUpperCase();
     if (entryMethod !== '*' && entryMethod !== verb) continue;
     if (pathMatches(entry.path, path)) return entry;
