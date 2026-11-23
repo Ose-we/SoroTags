@@ -322,6 +322,24 @@ describe('POST /api/v1/register — validation and conflict handling', () => {
     expect(res.body.error.message).toMatch(/Secret Key/i);
   });
 
+  it('rejects an invalid Stellar address before making database writes', async () => {
+    const { StrKey } = require('@stellar/stellar-sdk');
+    StrKey.isValidEd25519PublicKey.mockReturnValueOnce(false);
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .set('Content-Type', 'application/json')
+      .send({ username: 'alice123', address: 'not-a-stellar-address' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatchObject({
+      code: 'INVALID_INPUT',
+      message: 'Invalid Stellar address',
+    });
+    expect(mockCount).not.toHaveBeenCalled();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
   it('returns 200 or 201 and includes username, address, is_primary, federation_address in response', async () => {
     mockCount.mockResolvedValue(0);
     mockCreate.mockResolvedValue({

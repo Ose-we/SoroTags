@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const request = require('supertest');
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
@@ -278,26 +279,32 @@ describe('Rate Limiting — express-rate-limit', () => {
     const ANONYMOUS_LIMIT = 100;
     const AUTHENTICATED_LIMIT = 1000;
     const VALID_API_KEY = 'valid-api-key';
+    const SECOND_VALID_API_KEY = 'second-valid-api-key';
     const INVALID_API_KEY = 'invalid-api-key';
+    const keyHashes = new Map(
+      [VALID_API_KEY, SECOND_VALID_API_KEY].map((key) => [
+        crypto.createHash('sha256').update(key).digest('hex'),
+        key,
+      ]),
+    );
 
     // The API key validator is mocked so that only VALID_API_KEY is accepted.
     beforeEach(() => {
       const { prisma } = require('../prismaClient');
       prisma.apiKey = {
-        findUnique: jest.fn(({ where }) =>
-          Promise.resolve(
-            where && where.key === VALID_API_KEY
-              ? { id: 'key-1', key: VALID_API_KEY, revoked: false }
+        findUnique: jest.fn(({ where }) => {
+          const apiKey = keyHashes.get(where.keyHash);
+          return Promise.resolve(
+            apiKey
+              ? {
+                  id: 'shared-record-id',
+                  keyHash: where.keyHash,
+                  revokedAt: null,
+                  expiresAt: null,
+                }
               : null,
-          ),
-        ),
-        findFirst: jest.fn(({ where }) =>
-          Promise.resolve(
-            where && where.key === VALID_API_KEY
-              ? { id: 'key-1', key: VALID_API_KEY, revoked: false }
-              : null,
-          ),
-        ),
+          );
+        }),
       };
     });
 
@@ -367,6 +374,44 @@ describe('Rate Limiting — express-rate-limit', () => {
 
         expect(res.status).toBe(200);
       }
+    });
+
+    it('does not apply the extra anonymous per-IP cap to authenticated requests', async () => {
+      for (let i = 0; i < ANONYMOUS_LIMIT + 5; i++) {
+        const res = await request(app)
+          .get('/federation')
+          .query({ q: 'client*localhost' })
+          .set('X-Api-Key', VALID_API_KEY);
+
+        expect(res.status).toBe(200);
+      }
+    });
+
+    it('looks up API keys by their hash and keeps each authenticated quota separate', async () => {
+      const { prisma } = require('../prismaClient');
+      const firstRes = await request(app)
+        .get('/api/v1/federation')
+        .query({ q: 'client*localhost' })
+        .set('X-Api-Key', VALID_API_KEY);
+      const secondRes = await request(app)
+        .get('/api/v1/federation')
+        .query({ q: 'client*localhost' })
+        .set('X-Api-Key', SECOND_VALID_API_KEY);
+
+      expect(prisma.apiKey.findUnique).toHaveBeenCalledWith({
+        where: {
+          keyHash: crypto
+            .createHash('sha256')
+            .update(VALID_API_KEY)
+            .digest('hex'),
+        },
+      });
+      expect(firstRes.headers['ratelimit-remaining']).toBe(
+        String(AUTHENTICATED_LIMIT - 1),
+      );
+      expect(secondRes.headers['ratelimit-remaining']).toBe(
+        String(AUTHENTICATED_LIMIT - 1),
+      );
     });
 
     it('includes Retry-After header on authenticated 429 responses', async () => {

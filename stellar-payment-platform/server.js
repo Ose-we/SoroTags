@@ -219,6 +219,12 @@ const v2Router = require("./src/routes/v2")(redisClient);
 // X-Api-Key get a higher ceiling than anonymous clients, so a single bot from
 // one IP cannot exhaust the shared anonymous pool and deny service to others.
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_AUTHENTICATED_WINDOW_MS =
+  parseInt(process.env.RATE_LIMIT_AUTHENTICATED_WINDOW_MS, 10) ||
+  RATE_LIMIT_WINDOW_MS;
+const RATE_LIMIT_ANONYMOUS_WINDOW_MS =
+  parseInt(process.env.RATE_LIMIT_ANONYMOUS_WINDOW_MS, 10) ||
+  RATE_LIMIT_WINDOW_MS;
 const RATE_LIMIT_AUTHENTICATED =
   parseInt(process.env.RATE_LIMIT_AUTHENTICATED, 10) || 1000;
 const RATE_LIMIT_ANONYMOUS =
@@ -250,59 +256,50 @@ const validateApiKey = async (apiKey) => {
 // Attach the validated API key record (if any) to the request so the limiter
 // can pick the right tier without re-validating.
 const apiKeyTier = async (req, res, next) => {
-  try {
-    req.apiKeyRecord = await validateApiKey(getRequestApiKey(req));
-  } catch (err) {
-    req.apiKeyRecord = null;
-  }
+  req.apiKeyRecord = await validateApiKey(getRequestApiKey(req));
   next();
 };
 
-const limiter = rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  // The effective limit depends on the tier; resolved per request below.
-  max: (req) =>
-    req.apiKeyRecord ? RATE_LIMIT_AUTHENTICATED : RATE_LIMIT_ANONYMOUS,
-  // Use Redis-backed store when available
-  store: redisClient
-    ? new RedisStore({
-        sendCommand: (...args) => redisClient.sendCommand(args),
-      })
-    : undefined,
-  // Return the standard RateLimit-* headers only
-  standardHeaders: true,
-  legacyHeaders: true,
-  message: errorBody(
-    "RATE_LIMITED",
-    "Too many requests, please try again later.",
-  ),
-  // Prometheus scrapes /metrics on a fixed interval from a single address, so
-  // counting those scrapes against the shared quota would 429 the scraper.
-  skip: (req) => req.path === "/metrics",
-  // Key by tier + identifier so the authenticated and anonymous pools are
-  // isolated from one another. Authenticated requests are keyed by API key;
-  // anonymous requests fall back to the client IP.
-  keyGenerator: (req /*, res */) => {
-    try {
-      if (req.apiKeyRecord) {
-        return `auth:${req.apiKeyRecord.id || getRequestApiKey(req)}`;
-      }
-      return `anon:${req.ip || (req.connection && req.connection.remoteAddress) || ""}`;
-    } catch (err) {
-      // On error, fall back to IP so rate limiting still works
-      return `anon:${req.ip || ""}`;
-    }
-  },
-  // #177 — Include Retry-After on 429 responses so clients know when to retry.
-  handler: (req, res, next, options) => {
-    const retryAfter = Math.max(
-      1,
-      Math.ceil((options.windowMs || RATE_LIMIT_WINDOW_MS) / 1000),
-    );
-    res.set("Retry-After", String(retryAfter));
-    res.status(options.statusCode).json(options.message);
-  },
+const createRateLimiter = ({ windowMs, max }) =>
+  rateLimit({
+    windowMs,
+    max,
+    store: redisClient
+      ? new RedisStore({
+          sendCommand: (...args) => redisClient.sendCommand(args),
+        })
+      : undefined,
+    standardHeaders: true,
+    legacyHeaders: true,
+    message: errorBody(
+      "RATE_LIMITED",
+      "Too many requests, please try again later.",
+    ),
+    skip: (req) => req.path === "/metrics",
+    keyGenerator: (req) =>
+      req.apiKeyRecord
+        ? `auth:${req.apiKeyRecord.keyHash}`
+        : `anon:${req.ip || (req.connection && req.connection.remoteAddress) || ""}`,
+    handler: (req, res, next, options) => {
+      const retryAfter = Math.max(
+        1,
+        Math.ceil((options.windowMs || windowMs) / 1000),
+      );
+      res.set("Retry-After", String(retryAfter));
+      res.status(options.statusCode).json(options.message);
+    },
+  });
+
+const authenticatedLimiter = createRateLimiter({
+  windowMs: RATE_LIMIT_AUTHENTICATED_WINDOW_MS,
+  max: RATE_LIMIT_AUTHENTICATED,
 });
+const anonymousLimiter = createRateLimiter({
+  windowMs: RATE_LIMIT_ANONYMOUS_WINDOW_MS,
+  max: RATE_LIMIT_ANONYMOUS,
+});
+const limiter = (req, res, next) =>
+  (req.apiKeyRecord ? authenticatedLimiter : anonymousLimiter)(req, res, next);
 
 // Per-IP limiter specifically for sensitive, unauthenticated endpoints.
 // Keys strictly by client IP so brute-force/spam from a single source is
@@ -321,6 +318,7 @@ const ipLimiter = rateLimit({
     "RATE_LIMITED",
     "Too many requests, please try again later.",
   ),
+  skip: (req) => Boolean(req.apiKeyRecord),
   keyGenerator: (req) =>
     req.ip || (req.connection && req.connection.remoteAddress) || "",
 });
@@ -626,9 +624,7 @@ app.get(
         });
 
         if (!cached) {
-          const notFoundError = new Error("Address not found");
-          notFoundError.statusCode = 404;
-          return next(notFoundError);
+          return next(new ApiError("NOT_FOUND", "Address not found"));
         }
 
         return res.json(cached);
@@ -682,9 +678,7 @@ app.get(
         });
 
         if (!cached) {
-          const notFoundError = new Error("Name tag not found");
-          notFoundError.statusCode = 404;
-          return next(notFoundError);
+          return next(new ApiError("NOT_FOUND", "Name tag not found"));
         }
 
         return res.json(cached);
@@ -841,9 +835,7 @@ app.post(
     }
 
     if (!StrKey.isValidEd25519PublicKey(address)) {
-      const error = new Error("Invalid Stellar Public Key format.");
-      error.statusCode = 400;
-      return next(error);
+      return next(new ApiError("INVALID_INPUT", "Invalid Stellar address"));
     }
 
     const memoError = validateMemo(memoType, memo);

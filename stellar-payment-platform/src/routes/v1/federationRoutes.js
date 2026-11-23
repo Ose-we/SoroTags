@@ -62,9 +62,7 @@ router.get(
         });
 
         if (!cached) {
-          const notFoundError = new Error('Address not found');
-          notFoundError.statusCode = 404;
-          return next(notFoundError);
+          return next(new ApiError('NOT_FOUND', 'Address not found'));
         }
 
         return res.json(cached);
@@ -94,9 +92,7 @@ router.get(
         });
 
         if (!cached) {
-          const notFoundError = new Error('Name tag not found');
-          notFoundError.statusCode = 404;
-          return next(notFoundError);
+          return next(new ApiError('NOT_FOUND', 'Name tag not found'));
         }
 
         return res.json(cached);

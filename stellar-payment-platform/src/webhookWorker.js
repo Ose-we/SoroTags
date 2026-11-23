@@ -1,8 +1,8 @@
 const crypto = require('crypto');
-const { Queue, Worker } = require('bullmq');
+const { Queue, Worker, UnrecoverableError } = require('bullmq');
 const { createRedisConnection } = require('./config/redis');
 const { logger } = require('./logger');
-const { shouldFallbackToLocalRegistry } = require('./utils');
+const { shouldFallbackToLocalRegistry, exponentialDelay } = require('./utils');
 const {
   updatePaymentIntentStatus,
   VALID_TRANSITIONS,
@@ -13,6 +13,7 @@ const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
 const MAX_WEBHOOK_ATTEMPTS = 5;
 const WEBHOOK_WORKER_CONCURRENCY = Number(process.env.WEBHOOK_CONCURRENCY) || 10;
 const MAX_RETRY_BACKLOG_DAYS = 3;
+const RETRYABLE_WEBHOOK_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 // Exponential backoff configuration for failed webhook deliveries.
 // Base 30s, factor 2, capped at 1h, with ±10% jitter to avoid thundering herds.
@@ -243,7 +244,11 @@ const sendWebhook = async (url, payload, secret) => {
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`Webhook responded with HTTP ${response.status}`);
+      const message = `Webhook responded with HTTP ${response.status}`;
+      if (!RETRYABLE_WEBHOOK_STATUSES.has(response.status)) {
+        throw new UnrecoverableError(message);
+      }
+      throw new Error(message);
     }
     return { ok: true };
   } finally {
@@ -321,7 +326,7 @@ const applyWebhookPaymentIntentStatus = async ({
 };
 
 const processWebhookJob = async (job, { prisma, poolRunFn }) => {
-  const { webhook, payload } = job.data;
+  const { webhook, payload, webhookEventId } = job.data;
   const now = new Date();
 
   try {
@@ -334,7 +339,30 @@ const processWebhookJob = async (job, { prisma, poolRunFn }) => {
         `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
       );
     }
+    if (webhookEventId && prisma.webhookEvent) {
+      await prisma.webhookEvent.update({
+        where: { id: webhookEventId },
+        data: {
+          attemptCount: { increment: 1 },
+          status: 'failed',
+          lastError: error.message,
+          deliveredAt: null,
+        },
+      });
+    }
     throw error;
+  }
+
+  if (webhookEventId && prisma.webhookEvent) {
+    await prisma.webhookEvent.update({
+      where: { id: webhookEventId },
+      data: {
+        attemptCount: { increment: 1 },
+        status: 'delivered',
+        lastError: null,
+        deliveredAt: now,
+      },
+    });
   }
 
   try {
@@ -393,6 +421,10 @@ const startWebhookWorker = ({ prisma, poolRunFn }) => {
     {
       connection: workerConnection,
       concurrency: WEBHOOK_WORKER_CONCURRENCY,
+      settings: {
+        backoffStrategy: (attemptsMade, type) =>
+          type === 'custom' ? computeRetryDelay(attemptsMade) : -1,
+      },
     },
   );
 
@@ -400,10 +432,17 @@ const startWebhookWorker = ({ prisma, poolRunFn }) => {
     const maxAttempts = job?.opts?.attempts || MAX_WEBHOOK_ATTEMPTS;
     const attemptsMade = job?.attemptsMade || 1;
 
-    if (attemptsMade >= maxAttempts && job?.data?.webhook) {
+    if (
+      (attemptsMade >= maxAttempts || error instanceof UnrecoverableError) &&
+      job?.data?.webhook
+    ) {
       logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retries exhausted (${attemptsMade}/${maxAttempts})`);
       try {
-        await moveToDLQ(prisma, poolRunFn, job.data.webhook);
+        if (job.data.webhookEventId) {
+          await moveWebhookEventToDLQ(prisma, job.data, attemptsMade, error);
+        } else {
+          await moveToDLQ(prisma, poolRunFn, job.data.webhook);
+        }
       } catch (dlqErr) {
         logger.error(`[webhook-worker] Failed to move webhook ${job.data.webhook.id} to DLQ: ${dlqErr.message}`);
       }
@@ -430,16 +469,65 @@ const buildJobId = (webhookId, eventId) => {
   return crypto.createHash('sha256').update(`${webhookId}:${eventId}`).digest('hex');
 };
 
-const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue(), prisma) => {
+  const webhookEventId = buildJobId(webhook.id, payload.event_id);
+  const deliveryData = { webhook, payload };
+  if (prisma?.webhookEvent) {
+    await prisma.webhookEvent.upsert({
+      where: { id: webhookEventId },
+      update: {},
+      create: {
+        id: webhookEventId,
+        eventType: payload.event,
+        payload: JSON.stringify(payload),
+        merchantId: webhook.id,
+        status: 'pending',
+      },
+    });
+    deliveryData.webhookEventId = webhookEventId;
+  }
+
   return queue.add(
     'deliver',
-    { webhook, payload },
+    deliveryData,
     {
       ...WEBHOOK_JOB_OPTIONS,
       backoff: { ...WEBHOOK_JOB_OPTIONS.backoff },
       jobId: buildJobId(webhook.id, payload.event_id),
     },
   );
+};
+
+const moveWebhookEventToDLQ = async (prisma, jobData, attemptsMade, error) => {
+  const { webhook, payload, webhookEventId } = jobData;
+  const dlqId = `dlq-${webhookEventId}`;
+  const existing = await prisma.webhookDLQ.findUnique({ where: { id: dlqId } });
+
+  if (!existing) {
+    await prisma.webhookDLQ.create({
+      data: {
+        id: dlqId,
+        webhookId: webhook.id,
+        webhookUrl: webhook.url,
+        webhookSecret: webhook.secret,
+        username: webhook.username,
+        eventType: payload.event,
+        eventPayload: JSON.stringify(payload),
+        failureReason: error.message,
+        deliveryAttempts: attemptsMade,
+        replayed: false,
+      },
+    });
+  }
+
+  await prisma.webhookEvent.update({
+    where: { id: webhookEventId },
+    data: {
+      attemptCount: attemptsMade,
+      lastError: error.message,
+      status: 'dead_letter',
+    },
+  });
 };
 
 const formatAsset = (payment) => {
@@ -482,7 +570,7 @@ const dispatchPaymentWebhooks = async ({ prisma, poolGetFn, payment, queue }) =>
       logger.info(`[webhook-worker] Skipping webhook id=${webhook.id} url=${webhook.url} for event=${payload.event} due to subscription filter`);
       return;
     }
-    await enqueueWebhookDelivery(webhook, payload, deliveryQueue);
+    await enqueueWebhookDelivery(webhook, payload, deliveryQueue, prisma);
     logger.info(
       `[webhook-queue] Enqueued event=${payload.event_id} webhook=${webhook.id} recipient=${recipientAddress}`,
     );
@@ -706,6 +794,7 @@ module.exports = {
   computeSignature,
   detectSsrfTarget,
   computeRetryDelay,
+  moveWebhookEventToDLQ,
   WEBHOOK_TIMEOUT_MS,
   WEBHOOK_QUEUE_NAME,
   MAX_WEBHOOK_ATTEMPTS,
